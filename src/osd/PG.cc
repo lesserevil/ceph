@@ -457,6 +457,18 @@ bool PG::MissingLoc::readable_with_acting(
   return (*is_readable)(have_acting);
 }
 
+void PG::MissingLoc::add_batch_sources_info(
+  const set<pg_shard_t> &sources)
+{
+  dout(10) << __func__ << ": adding sources in batch " << sources.size() << dendl;
+  for (map<hobject_t, pg_missing_t::item>::const_iterator i = needs_recovery_map.begin(); 
+      i != needs_recovery_map.end();
+      ++i) {
+    missing_loc[i->first].insert(sources.begin(), sources.end());
+    missing_loc_sources.insert(sources.begin(), sources.end());
+    }
+}
+
 bool PG::MissingLoc::add_source_info(
   pg_shard_t fromosd,
   const pg_info_t &oinfo,
@@ -792,6 +804,8 @@ bool PG::all_unfound_are_queried_or_lost(const OSDMapRef osdmap) const
     if (iter != peer_info.end() &&
         (iter->second.is_empty() || iter->second.dne()))
       continue;
+    if (!osdmap->exists(peer->osd))
+      continue;
     const osd_info_t &osd_info(osdmap->get_info(peer->osd));
     if (osd_info.lost_at <= osd_info.up_from) {
       // If there is even one OSD in might_have_unfound that isn't lost, we
@@ -961,7 +975,8 @@ map<pg_shard_t, pg_info_t>::const_iterator PG::find_best_info(
     }
 
     // prefer current primary (usually the caller), all things being equal
-    if (p->first == pg_whoami) {
+    if (p->first == pg_whoami &&
+	!cct->_conf->osd_debug_find_best_info_ignore_primary) {
       dout(10) << "calc_acting prefer osd." << p->first
 	       << " because it is current primary" << dendl;
       best = p;
@@ -1666,14 +1681,19 @@ void PG::activate(ObjectStore::Transaction& t,
     }
 
     // Set up missing_loc
+    set<pg_shard_t> complete_shards;
     for (set<pg_shard_t>::iterator i = actingbackfill.begin();
 	 i != actingbackfill.end();
 	 ++i) {
       if (*i == get_primary()) {
-	missing_loc.add_active_missing(pg_log.get_missing());
+	missing_loc.add_active_missing(missing);
+        if (!missing.have_missing())
+          complete_shards.insert(*i);
       } else {
 	assert(peer_missing.count(*i));
 	missing_loc.add_active_missing(peer_missing[*i]);
+        if (!peer_missing[*i].have_missing())
+          complete_shards.insert(*i);
       }
     }
     // If necessary, create might_have_unfound to help us find our unfound objects.
@@ -1681,19 +1701,27 @@ void PG::activate(ObjectStore::Transaction& t,
     // past intervals.
     might_have_unfound.clear();
     if (needs_recovery()) {
-      missing_loc.add_source_info(pg_whoami, info, pg_log.get_missing(), ctx->handle);
-      for (set<pg_shard_t>::iterator i = actingbackfill.begin();
-	   i != actingbackfill.end();
-	   ++i) {
-	if (*i == pg_whoami) continue;
-	dout(10) << __func__ << ": adding " << *i << " as a source" << dendl;
-	assert(peer_missing.count(*i));
-	assert(peer_info.count(*i));
-	missing_loc.add_source_info(
-	  *i,
-	  peer_info[*i],
-	  peer_missing[*i],
-          ctx->handle);
+      // If only one shard has missing, we do a trick to add all others as recovery
+      // source, this is considered safe since the PGLogs have been merged locally,
+      // and covers vast majority of the use cases, like one OSD/host is down for
+      // a while for hardware repairing
+      if (complete_shards.size() + 1 == actingbackfill.size()) {
+        missing_loc.add_batch_sources_info(complete_shards);
+      } else {
+        missing_loc.add_source_info(pg_whoami, info, pg_log.get_missing(), ctx->handle);
+        for (set<pg_shard_t>::iterator i = actingbackfill.begin();
+	     i != actingbackfill.end();
+	     ++i) {
+	  if (*i == pg_whoami) continue;
+	  dout(10) << __func__ << ": adding " << *i << " as a source" << dendl;
+	  assert(peer_missing.count(*i));
+	  assert(peer_info.count(*i));
+	  missing_loc.add_source_info(
+	    *i,
+	    peer_info[*i],
+	    peer_missing[*i],
+            ctx->handle);
+        }
       }
       for (map<pg_shard_t, pg_missing_t>::iterator i = peer_missing.begin();
 	   i != peer_missing.end();
@@ -3747,6 +3775,10 @@ void PG::replica_scrub(
 void PG::scrub(ThreadPool::TPHandle &handle)
 {
   lock();
+  if (deleting) {
+    unlock();
+    return;
+  }
   if (g_conf->osd_scrub_sleep > 0 &&
       (scrubber.state == PG::Scrubber::NEW_CHUNK ||
        scrubber.state == PG::Scrubber::INACTIVE)) {
@@ -3757,10 +3789,6 @@ void PG::scrub(ThreadPool::TPHandle &handle)
     t.sleep();
     lock();
     dout(20) << __func__ << " slept for " << t << dendl;
-  }
-  if (deleting) {
-    unlock();
-    return;
   }
 
   if (!is_primary() || !is_active() || !is_clean() || !is_scrubbing()) {
@@ -4224,8 +4252,9 @@ void PG::scrub_process_inconsistent()
   bool repair = state_test(PG_STATE_REPAIR);
   bool deep_scrub = state_test(PG_STATE_DEEP_SCRUB);
   const char *mode = (repair ? "repair": (deep_scrub ? "deep-scrub" : "scrub"));
-
-  if (!scrubber.authoritative.empty() || !scrubber.inconsistent.empty()) {
+  
+  // authoriative only store objects which missing or inconsistent.
+  if (!scrubber.authoritative.empty()) {
     stringstream ss;
     ss << info.pgid << " " << mode << " "
        << scrubber.missing.size() << " missing, "
@@ -7318,7 +7347,20 @@ PG::RecoveryState::GetMissing::GetMissing(my_context ctx)
     }
 
     // all good!
-    post_event(Activate(pg->get_osdmap()->get_epoch()));
+    if (pg->cct->_conf->osd_debug_delay_activate &&
+        pg->cct->_conf->osd_debug_delay_activate_prob &&
+	((unsigned)(rand() % 100) <
+	 pg->cct->_conf->osd_debug_delay_activate_prob)) {
+      dout(0) << "DEBUG: delaying activation" << dendl;
+      Mutex::Locker l(pg->osd->debug_peering_delay_lock);
+      pg->osd->debug_peering_delay_timer.add_event_after(
+	pg->cct->_conf->osd_debug_delay_activate,
+	new QueuePeeringEvt<Activate>(
+	  pg, pg->get_osdmap()->get_epoch(),
+	  Activate(pg->get_osdmap()->get_epoch())));
+    } else {
+      post_event(Activate(pg->get_osdmap()->get_epoch()));
+    }
   } else {
     pg->publish_stats_to_osd();
   }
@@ -7339,7 +7381,21 @@ boost::statechart::result PG::RecoveryState::GetMissing::react(const MLogRec& lo
     } else {
       dout(10) << "Got last missing, don't need missing "
 	       << "posting CheckRepops" << dendl;
-      post_event(Activate(pg->get_osdmap()->get_epoch()));
+      // all good!
+      if (pg->cct->_conf->osd_debug_delay_activate &&
+	  pg->cct->_conf->osd_debug_delay_activate_prob &&
+	  ((unsigned)(rand() % 100) <
+	   pg->cct->_conf->osd_debug_delay_activate_prob)) {
+	dout(0) << "DEBUG: delaying activation" << dendl;
+	Mutex::Locker l(pg->osd->debug_peering_delay_lock);
+	pg->osd->debug_peering_delay_timer.add_event_after(
+	  pg->cct->_conf->osd_debug_delay_activate,
+	  new QueuePeeringEvt<Activate>(
+	    pg, pg->get_osdmap()->get_epoch(),
+	    Activate(pg->get_osdmap()->get_epoch())));
+      } else {
+	post_event(Activate(pg->get_osdmap()->get_epoch()));
+      }
     }
   }
   return discard_event();
@@ -7384,7 +7440,8 @@ void PG::RecoveryState::GetMissing::exit()
 /*------WaitUpThru--------*/
 PG::RecoveryState::WaitUpThru::WaitUpThru(my_context ctx)
   : my_base(ctx),
-    NamedState(context< RecoveryMachine >().pg->cct, "Started/Primary/Peering/WaitUpThru")
+    NamedState(context< RecoveryMachine >().pg->cct, "Started/Primary/Peering/WaitUpThru"),
+    delayed_activation(false)
 {
   context< RecoveryMachine >().log_enter(state_name);
 }
@@ -7392,8 +7449,22 @@ PG::RecoveryState::WaitUpThru::WaitUpThru(my_context ctx)
 boost::statechart::result PG::RecoveryState::WaitUpThru::react(const ActMap& am)
 {
   PG *pg = context< RecoveryMachine >().pg;
-  if (!pg->need_up_thru) {
-    post_event(Activate(pg->get_osdmap()->get_epoch()));
+  if (!delayed_activation && !pg->need_up_thru) {
+    if (pg->cct->_conf->osd_debug_delay_activate &&
+        pg->cct->_conf->osd_debug_delay_activate_prob &&
+	((unsigned)(rand() % 100) <
+	 pg->cct->_conf->osd_debug_delay_activate_prob)) {
+      dout(0) << "DEBUG: delaying activation" << dendl;
+      Mutex::Locker l(pg->osd->debug_peering_delay_lock);
+      pg->osd->debug_peering_delay_timer.add_event_after(
+	pg->cct->_conf->osd_debug_delay_activate,
+	new QueuePeeringEvt<Activate>(
+	  pg, pg->get_osdmap()->get_epoch(),
+	  Activate(pg->get_osdmap()->get_epoch())));
+      delayed_activation = true;
+    } else {
+      post_event(Activate(pg->get_osdmap()->get_epoch()));
+    }
   }
   return forward_event();
 }

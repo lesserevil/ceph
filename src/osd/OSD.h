@@ -670,6 +670,9 @@ public:
   Mutex backfill_request_lock;
   SafeTimer backfill_request_timer;
 
+  Mutex debug_peering_delay_lock;
+  SafeTimer debug_peering_delay_timer;
+
   // -- tids --
   // for ops i issue
   ceph_tid_t last_tid;
@@ -918,6 +921,12 @@ protected:
   Mutex osd_lock;			// global lock
   SafeTimer tick_timer;    // safe timer (osd_lock)
 
+  // Tick timer for those stuff that do not need osd_lock
+  Mutex tick_timer_lock;
+  SafeTimer tick_timer_without_osd_lock;
+
+  static const double OSD_TICK_INTERVAL; // tick interval for tick_timer and tick_timer_without_osd_lock
+
   AuthAuthorizeHandlerRegistry *authorize_handler_cluster_registry;
   AuthAuthorizeHandlerRegistry *authorize_handler_service_registry;
 
@@ -944,12 +953,22 @@ protected:
     }
   };
 
+  class C_Tick_WithoutOSDLock : public Context {
+    OSD *osd;
+  public:
+    C_Tick_WithoutOSDLock(OSD *o) : osd(o) {}
+    void finish(int r) {
+      osd->tick_without_osd_lock();
+    }
+  };
+
   Cond dispatch_cond;
   int dispatch_running;
 
   void create_logger();
   void create_recoverystate_perf();
   void tick();
+  void tick_without_osd_lock();
   void _dispatch(Message *m);
   void dispatch_op(OpRequestRef op);
   bool dispatch_op_fast(OpRequestRef& op, OSDMapRef& osdmap);
