@@ -686,9 +686,14 @@ static int do_unmap()
   if (ioctl(nbd, NBD_DISCONNECT) < 0) {
     cerr << "rbd-nbd: the device is not used" << std::endl;
   }
-  close(nbd);
 
-  return 0;
+  int ret = close(nbd);
+  if (ret == 0) {
+    return 0;
+  } else {
+    return errno;
+  }
+
 }
 
 static int parse_imgpath(const std::string &imgpath)
